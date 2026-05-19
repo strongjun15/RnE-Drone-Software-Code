@@ -1,0 +1,89 @@
+from djitellopy import Tello
+from ultralytics import YOLO
+import cv2
+import time
+
+
+def main():
+    # YOLO 모델 로드
+    model = YOLO("yolo11n.pt")
+    class_names = model.names
+
+    tello = Tello()
+    tello.connect()
+    print("배터리:", tello.get_battery(), "%")
+
+
+    tello.streamon()
+    frame_read = tello.get_frame_read()
+
+
+    tello.takeoff()
+    time.sleep(2)
+
+    CONF_TH = 0.25
+
+    try:
+        while True:
+            frame = frame_read.frame
+            if frame is None:
+                continue
+
+
+            results = model(frame, conf=CONF_TH, verbose=False)
+            result = results[0]
+
+            annotated_frame = frame.copy()
+
+            if result.boxes is not None:
+                boxes = result.boxes.xyxy.cpu().numpy()
+                scores = result.boxes.conf.cpu().numpy()
+                classes = result.boxes.cls.cpu().numpy()
+
+                for box, score, cls_id in zip(boxes, scores, classes):
+                    if score < CONF_TH:
+                        continue
+
+                    x1, y1, x2, y2 = map(int, box)
+                    label = f"{class_names[int(cls_id)]} {score:.2f}"
+
+                    # 바운딩 박스
+                    cv2.rectangle(
+                        annotated_frame,
+                        (x1, y1),
+                        (x2, y2),
+                        (0, 255, 0),
+                        2
+                    )
+
+                    # 라벨
+                    cv2.putText(
+                        annotated_frame,
+                        label,
+                        (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 0),
+                        2
+                    )
+
+            cv2.imshow("Tello + YOLO Detection", annotated_frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("q 입력 -> 착륙 후 종료")
+                break
+
+    finally:
+        try:
+            tello.land()
+        except Exception as e:
+            print("land 오류:", e)
+
+        tello.streamoff()
+        tello.end()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

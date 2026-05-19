@@ -1,0 +1,121 @@
+from djitellopy import Tello
+from ultralytics import YOLO
+import cv2
+import time
+import numpy as np
+
+
+def get_main_person_center_x(result, frame_width):
+    '''
+    YOLO 결과에서 person(class 0)들 중 가장 큰 사람의
+    x 중심 좌표를 (축소된 프레임 기준) 반환.
+    없으면 None으로.
+    '''
+    boxes = result.boxes
+
+    if boxes is None or len(boxes) == 0:
+        return None
+
+    xyxy = boxes.xyxy.cpu().numpy()  # [N, 4] 형태
+    classes = boxes.cls.cpu().numpy()
+
+    main_center_x = None
+    main_area = 0
+
+    for box, cls_id in zip(xyxy, classes):
+        if int(cls_id) != 0:  # 0 = person
+            continue
+
+        x1, y1, x2, y2 = box
+        w = x2 - x1
+        h = y2 - y1
+        area = w * h
+        center_x = (x1 + x2) / 2
+
+        if area > main_area:
+            main_area = area
+            main_center_x = center_x
+
+    return main_center_x
+
+
+def main():
+    # YOLO 디텍션 모델
+    model = YOLO("yolo11n.pt")
+
+    tello = Tello()
+    tello.connect()
+    print("배터리:", tello.get_battery())
+
+    tello.streamon()
+    frame_read = tello.get_frame_read()
+
+    tello.takeoff()
+    time.sleep(2)
+
+    # YOLO 입력 크기 (작게)
+    YOLO_W, YOLO_H = 320, 240
+
+    center_tolerance_ratio = 0.06  # 중앙 ±6% 안이면 회전 안 함
+
+    # yaw 속도 비례 제어 계수
+    Kp = 60
+    MAX_YAW = 80  # Tello rc yaw 속도 최대 절대값
+
+    try:
+        while True:
+            frame = frame_read.frame
+            if frame is None:
+                continue
+
+            # ====== (1) YOLO는 계산만 하고 ======
+            person_center_ratio = None
+
+            small = cv2.resize(frame, (YOLO_W, YOLO_H))
+            try:
+                results = model(small, verbose=False)
+                result = results[0]
+
+                person_center_x_small = get_main_person_center_x(result, YOLO_W)
+
+                if person_center_x_small is not None:
+                    person_center_ratio = (person_center_x_small - YOLO_W / 2) / (YOLO_W / 2)
+                else:
+                    person_center_ratio = None
+
+            except Exception as e:
+                print("YOLO 추론 중 오류:", e)
+
+            # ====== (2) 제어만 하고 (화면에는 아무것도 안 그림) ======
+            yaw_speed = 0
+            if person_center_ratio is not None and abs(person_center_ratio) > center_tolerance_ratio:
+                yaw_speed = int(person_center_ratio * Kp)
+                yaw_speed = int(np.clip(yaw_speed, -MAX_YAW, MAX_YAW))
+
+            try:
+                tello.send_rc_control(0, 0, 0, yaw_speed)
+            except Exception as e:
+                print("send_rc_control 오류:", e)
+
+            # ====== (3) 창에는 "원본 프레임 그대로"만 송출 ======
+            cv2.imshow("Tello Live (Clean)", frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("q 입력, 정지 및 착륙")
+                tello.send_rc_control(0, 0, 0, 0)
+                tello.land()
+                break
+
+    finally:
+        try:
+            tello.send_rc_control(0, 0, 0, 0)
+        except Exception:
+            pass
+        tello.streamoff()
+        tello.end()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

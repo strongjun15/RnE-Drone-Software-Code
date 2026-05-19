@@ -1,0 +1,171 @@
+from djitellopy import Tello
+from ultralytics import YOLO
+import cv2
+import time
+import numpy as np
+
+TARGET_CLASS_ID = 32  # COCO: sports ball
+
+
+def get_main_ball_box(result):
+    '''
+    YOLO 결과에서 sports ball(class 32)들 중 '가장 큰 공' 1개의
+    박스(x1,y1,x2,y2)와 conf를 반환. 없으면 (None, None)
+    '''
+    boxes = result.boxes
+    if boxes is None or len(boxes) == 0:
+        return None, None
+
+    xyxy = boxes.xyxy.cpu().numpy() # [N, 4] 형태로 출력됨
+    classes = boxes.cls.cpu().numpy()
+    confs = boxes.conf.cpu().numpy() if boxes.conf is not None else None
+
+    best_box = None
+    best_conf = None
+    best_area = 0
+
+    for i, (box, cls_id) in enumerate(zip(xyxy, classes)):
+        if int(cls_id) != TARGET_CLASS_ID:
+            continue
+
+        x1, y1, x2, y2 = box
+        area = (x2 - x1) * (y2 - y1)
+        if area > best_area:
+            best_area = area
+            best_box = box
+            best_conf = float(confs[i]) if confs is not None else None
+
+    return best_box, best_conf
+
+
+def main():
+    model = YOLO("best.pt")
+
+    tello = Tello()
+    tello.connect()
+    print("배터리:", tello.get_battery())
+
+    tello.streamon()
+    frame_read = tello.get_frame_read()
+
+    tello.takeoff()
+    time.sleep(1)
+    tello.move_up(300)
+
+    # YOLO 입력 크기 (작게)
+    YOLO_W, YOLO_H = 320, 240
+
+    # 중앙 허용 오차
+    center_tolerance_ratio = 0.06
+
+    # yaw 속도 비례 제어
+    Kp = 60
+    MAX_YAW = 80
+
+    try:
+        while True:
+            frame = frame_read.frame
+            if frame is None:
+                continue
+
+            # Tello 프레임이 RGB로 들어오는 경우가 많아서 OpenCV용 BGR로 변환
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+            h, w = frame.shape[:2]
+            frame_center_x = w / 2
+
+            annotated_frame = frame.copy()
+
+            # ✅ 매 프레임 YOLO 수행
+            sm            # 매 프레임 YOLO 수행_   
+
+            person_center_ratio = None
+            ball_box_full = None
+            ball_conf = None
+
+            try:
+                results = model(small, verbose=False)
+                result = results[0]
+
+                # 작은 프레임에서 가장 큰 공 박스 얻기
+                ball_box_small, ball_conf = get_main_ball_box(result)
+
+                if ball_box_small is not None:
+                    x1, y1, x2, y2 = ball_box_small
+
+                    # small(320x240) -> full(frame w,h)로 스케일 변환
+                    sx = w / YOLO_W
+                    sy = h / YOLO_H
+                    fx1, fy1, fx2, fy2 = int(x1 * sx), int(y1 * sy), int(x2 * sx), int(y2 * sy)
+                    ball_box_full = (fx1, fy1, fx2, fy2)
+
+                    # 중심 비율(-1~1)
+                    ball_center_x_small = (x1 + x2) / 2
+                    person_center_ratio = (ball_center_x_small - YOLO_W / 2) / (YOLO_W / 2)
+
+            except Exception as e:
+                print("YOLO 추론 중 오류:", e)
+
+            yaw_speed = 0
+
+            if person_center_ratio is not None:
+                # 화면 중앙선
+                cv2.line(annotated_frame, (int(frame_center_x), 0),
+                         (int(frame_center_x), h), (0, 255, 0), 1)
+
+                # 빨간 점 (공 x 위치)
+                px = int((person_center_ratio * (w / 2)) + frame_center_x)
+                cv2.circle(annotated_frame, (px, h // 2), 8, (0, 0, 255), -1)
+
+                # 공 박스 그리기
+                if ball_box_full is not None:
+                    x1, y1, x2, y2 = ball_box_full
+                    cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                    label = "sports_ball"
+                    if ball_conf is not None:
+                        label += f" {ball_conf:.2f}"
+                    cv2.putText(annotated_frame, label, (x1, max(0, y1 - 8)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+                # yaw 제어
+                if abs(person_center_ratio) > center_tolerance_ratio:
+                    yaw_speed = int(person_center_ratio * Kp)
+                    yaw_speed = int(np.clip(yaw_speed, -MAX_YAW, MAX_YAW))
+                    cv2.putText(annotated_frame,
+                                f"TRACKING BALL yaw={yaw_speed}",
+                                (10, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+                else:
+                    cv2.putText(annotated_frame, "BALL CENTERED", (10, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+            else:
+                cv2.putText(annotated_frame, "NO BALL", (10, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+
+            # RC 제어
+            try:
+                tello.send_rc_control(0, 0, 0, yaw_speed)
+            except Exception as e:
+                print("send_rc_control 오류:", e)
+
+            cv2.imshow("Tello + YOLO Sports Ball Tracking", annotated_frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("🧨 q 입력, 정지 및 착륙")
+                tello.send_rc_control(0, 0, 0, 0)
+                tello.land()
+                break
+
+    finally:
+        try:
+            tello.send_rc_control(0, 0, 0, 0)
+        except Exception:
+            pass
+        tello.streamoff()
+        tello.end()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

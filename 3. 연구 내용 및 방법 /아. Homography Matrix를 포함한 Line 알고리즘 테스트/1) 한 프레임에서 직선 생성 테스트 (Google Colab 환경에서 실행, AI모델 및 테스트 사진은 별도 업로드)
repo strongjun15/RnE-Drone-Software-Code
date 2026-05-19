@@ -1,0 +1,238 @@
+# 1. 필수 라이브러리 설치 및 임포트
+!pip install ultralytics -q
+
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle, Circle, Arc
+from google.colab import files
+from ultralytics import YOLO
+
+# --- 가상 공간 좌표 (제공해주신 데이터) ---
+virtual_points_dict = {
+    'A1': (-14.0, 9.95), 'A3': (-14.0, 5.05), 'A2': (-8.2, 9.95), 'A4': (-8.2, 5.05),
+    'B1': (-11.01, 14.1), 'B2': (-11.01, 0.9), 'C1': (-5.675, 7.5),
+    'P1': (0.0, 15.0), 'P2': (0.0, 9.3),
+    'a1': (14.0, 9.95), 'a3': (14.0, 5.05), 'a2': (8.2, 9.95), 'a4': (8.2, 5.05),
+    'b1': (11.01, 14.1), 'b2': (11.01, 0.9), 'c1': (5.675, 7.5)
+}
+
+def transform_point(pt_screen, H_matrix):
+    pt_h = np.array([pt_screen[0], pt_screen[1], 1.0])
+    transformed = H_matrix @ pt_h
+    return transformed[:2] / transformed[2]
+
+def get_line_eq(p1, p2):
+    """두 점을 지나는 직선의 방정식 반환"""
+    if abs(p2[0] - p1[0]) < 1e-6: return f"x = {p1[0]:.2f}"
+    a = (p2[1] - p1[1]) / (p2[0] - p1[0])
+    b = p1[1] - a * p1[0]
+    return f"y = {a:.3f}x + ({b:.3f})"
+
+def draw_full_virtual_court(ax, line_color, bg_color):
+    """제공해주신 농구장 풀 디테일 그리기 로직"""
+    COURT_HALF_L = 14.0; COURT_W = 15.0; HOOP_OFFSET = 1.575
+    PAINT_L = 5.8; PAINT_W = 4.9; FREE_THROW_RADIUS = 1.8
+    THREE_PT_RADIUS = 6.75; THREE_PT_STRAIGHT = 2.99; THREE_PT_MARGIN = 0.9
+    CENTER_CIRCLE_RADIUS = 1.8
+
+    ax.add_patch(Rectangle((-COURT_HALF_L, 0), COURT_HALF_L*2, COURT_W, fill=False, lw=1.5, color=line_color))
+    ax.plot([0, 0], [0, COURT_W], lw=1.5, color=line_color, linestyle='--')
+    ax.add_patch(Circle((0, COURT_W/2), CENTER_CIRCLE_RADIUS, fill=True, color=line_color, alpha=0.1))
+    ax.add_patch(Circle((0, COURT_W/2), CENTER_CIRCLE_RADIUS, fill=False, lw=1.5, color=line_color))
+
+    def draw_half(is_left=True):
+        sign = 1 if is_left else -1
+        base_x = -COURT_HALF_L if is_left else COURT_HALF_L
+        hoop_x = base_x + sign * HOOP_OFFSET
+        paint_y = (COURT_W - PAINT_W) / 2
+        rect_x = base_x if is_left else base_x - PAINT_L
+        ax.add_patch(Rectangle((rect_x, paint_y), PAINT_L, PAINT_W, fill=False, lw=1.5, color=line_color))
+        ft_center_x = base_x + sign * PAINT_L
+        ax.add_patch(Arc((ft_center_x, COURT_W/2), FREE_THROW_RADIUS*2, FREE_THROW_RADIUS*2,
+                         theta1=270 if is_left else 90, theta2=90 if is_left else 270, lw=1.5, color=line_color))
+        ax.add_patch(Arc((ft_center_x, COURT_W/2), FREE_THROW_RADIUS*2, FREE_THROW_RADIUS*2,
+                         theta1=90 if is_left else 270, theta2=270 if is_left else 90, lw=1.5, color=line_color, linestyle=':'))
+        ax.plot([base_x, base_x + sign * THREE_PT_STRAIGHT], [THREE_PT_MARGIN, THREE_PT_MARGIN], lw=1.5, color=line_color)
+        ax.plot([base_x, base_x + sign * THREE_PT_STRAIGHT], [COURT_W - THREE_PT_MARGIN, COURT_W - THREE_PT_MARGIN], lw=1.5, color=line_color)
+        angle = np.arcsin((COURT_W/2 - THREE_PT_MARGIN) / THREE_PT_RADIUS) * 180 / np.pi
+        if is_left:
+            ax.add_patch(Arc((hoop_x, COURT_W/2), THREE_PT_RADIUS*2, THREE_PT_RADIUS*2, theta1=-angle, theta2=angle, lw=1.5, color=line_color))
+        else:
+            ax.add_patch(Arc((hoop_x, COURT_W/2), THREE_PT_RADIUS*2, THREE_PT_RADIUS*2, theta1=180-angle, theta2=180+angle, lw=1.5, color=line_color))
+
+    draw_half(True); draw_half(False)
+    for name, (px, py) in virtual_points_dict.items():
+        pt_color = '#ff0055' if name.isupper() else '#00ffcc'
+        ax.plot(px, py, marker='x', color=pt_color, markersize=8, markeredgewidth=2)
+        ax.text(px + (-0.8 if name.isupper() else 0.3), py + 0.4, name, fontsize=10, color='#e0f7fa', fontweight='bold')
+
+print("환경 설정 완료!")
+
+
+
+
+
+
+
+
+print("📂 [STEP 1] 모델 파일들을 업로드하세요. (yolov8n-pose-test4.pt, yolov8n.pt, best.pt)")
+model_uploads = files.upload()
+
+try:
+    global_model_pose = YOLO('yolov8n-pose-test4.pt')
+    global_model_gen  = YOLO('yolov8n.pt')
+    global_model_ball = YOLO('best.pt')
+    print("\n모든 모델이 성공적으로 로드되었습니다.")
+except Exception as e:
+    print(f"\n 모델 로드 중 오류 발생: {e}")
+
+
+
+
+
+
+
+
+
+from ultralytics import YOLO
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from google.colab import files # 코랩 파일 업로드용
+
+print("분석할 농구장 사진을 업로드하세요.")
+image_upload = files.upload()
+
+if image_upload:
+    img_name = list(image_upload.keys())[0]
+    img = cv2.imread(img_name)
+    img_vis = img.copy()
+    H_img, W_img, _ = img.shape
+
+    # ==========================================
+    # 1. AI 추론: 농구공 탐지 (best.pt 사용 가정)
+    # ==========================================
+    res_ball = global_model_ball.predict(img, conf=0.3, verbose=False)[0]
+    ball_px = (W_img * 0.35, H_img * 0.55) # 기본값
+
+    if len(res_ball.boxes) > 0:
+        box_xyxy = res_ball.boxes.xyxy[0].cpu().numpy()
+        x1, y1, x2, y2 = map(int, box_xyxy[:4])
+        ball_px = ((x1 + x2) / 2, (y1 + y2) / 2)
+        cv2.rectangle(img_vis, (x1, y1), (x2, y2), (0, 165, 255), 3) # 공 바운딩박스
+        cv2.putText(img_vis, 'Ball', (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
+
+    # ==========================================
+    # 1.5 AI 추론: 사람 탐지 (yolo11n.pt 사용 확정)
+    # ==========================================
+    # 업로드한 yolo11n.pt 모델을 이 셀에서 직접 불러옵니다.
+    model_person = YOLO("yolo11n.pt")
+    res_person = model_person.predict(img, conf=0.3, verbose=False)[0]
+
+    if len(res_person.boxes) > 0:
+        boxes_p = res_person.boxes.xyxy.cpu().numpy()
+        classes_p = res_person.boxes.cls.cpu().numpy()
+
+        for box, cls_id in zip(boxes_p, classes_p):
+            if int(cls_id) == 0:  # YOLO 모델에서 0번이 Person(사람)
+                px1, py1, px2, py2 = map(int, box[:4])
+                # 공과 똑같은 방식으로 그리기 (색깔만 보라색으로 구분)
+                cv2.rectangle(img_vis, (px1, py1), (px2, py2), (255, 0, 255), 3)
+                cv2.putText(img_vis, 'Person', (px1, py1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
+
+    # ==========================================
+    # 2. AI 추론: 코트 특징점 (Pose Model)
+    # ==========================================
+    idx_to_name = {
+        0: 'A1', 1: 'A3', 2: 'A4', 3: 'A2', 4: 'B1', 5: 'B2', 6: 'C1',
+        7: 'P1', 8: 'P2', 9: 'c1', 10: 'b2', 11: 'b1', 12: 'a2', 15: 'a4', 13: 'a1', 14: 'a3'
+    }
+
+    res_pts = global_model_pose.predict(img, verbose=False)[0]
+    actual_detected_pts = {}
+
+    if res_pts is not None and len(res_pts.keypoints.xy) > 0:
+        kpts = res_pts.keypoints.xy[0].cpu().numpy()
+        confs = res_pts.keypoints.conf[0].cpu().numpy()
+
+        for idx, pt in enumerate(kpts):
+            if idx in idx_to_name and confs[idx] > 0.5 and pt[0] > 0:
+                name = idx_to_name[idx]
+                actual_detected_pts[name] = (pt[0], pt[1])
+                cx, cy = int(pt[0]), int(pt[1])
+                cv2.circle(img_vis, (cx, cy), 8, (0, 255, 255), -1)
+                cv2.putText(img_vis, name, (cx + 10, cy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+    if len(actual_detected_pts) < 4:
+        print(f"경고: 코트 특징점이 {len(actual_detected_pts)}개만 검출되어 분석이 불가능합니다.")
+    else:
+        # ==========================================
+        # 3. 호모그래피 및 벡터 계산
+        # ==========================================
+        src_pts = np.array([actual_detected_pts[name] for name in actual_detected_pts.keys()], dtype=np.float32)
+        dst_pts = np.array([virtual_points_dict[name] for name in actual_detected_pts.keys()], dtype=np.float32)
+
+        H, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        drone_origin = np.array([0.0, 0.0])
+
+        p_center = transform_point((W_img / 2, H_img / 2), H)
+        heading_vector = p_center - drone_origin
+        heading_vector = (heading_vector / np.linalg.norm(heading_vector)) * 25.0
+        front_target = drone_origin + heading_vector
+
+        # Line 3 (Ball Direction)
+        ball_virtual_shadow = transform_point(ball_px, H)
+        ball_vector = ball_virtual_shadow - drone_origin
+        ball_target = drone_origin + (ball_vector / np.linalg.norm(ball_vector) * 25.0)
+
+        # Line 2 (Remapping)
+        vx, vy = ball_vector
+        theta = np.arctan2(abs(vy), abs(vx))
+        min_angle = np.arctan(1.5 / 14.0)
+        theta_new = (theta / (np.pi / 2)) * ((np.pi / 2) - min_angle) + min_angle
+        new_vx = np.cos(theta_new) * np.sign(vx)
+        new_vy = np.sin(theta_new) * np.sign(vy)
+        line2_target = drone_origin + (np.array([new_vx, new_vy]) * 25.0)
+
+        # ==========================================
+        # [상세 수치 출력 및 시각화 파트]
+        # ==========================================
+        print("\n" + "="*65)
+        print("📊 [DETAILED NUMERICAL ANALYSIS REPORT]")
+        print("="*65)
+        print(f"1. 검출된 특징점 개수: {len(actual_detected_pts)}개")
+        print(f"2. Ball Detection (Pixel): x={ball_px[0]:.2f}, y={ball_px[1]:.2f}")
+        print(f"3. Homography Matrix (H):\n{np.round(H, 4)}")
+        print("-" * 65)
+        print(f"4. Vector Line Equations (y = ax + b):")
+        print(f"   - Line 1: {get_line_eq(drone_origin, front_target)}")
+        print(f"   - Line 2: {get_line_eq(drone_origin, line2_target)}")
+        print(f"   - Line 3: {get_line_eq(drone_origin, ball_target)}")
+        print("="*65)
+
+        plt.figure(figsize=(14, 8))
+        # BGR -> RGB 변환 후 출력
+        plt.imshow(img_vis[:, :, ::-1])
+        plt.title("Detected Basketball, Person & Court Keypoints", fontsize=16, fontweight='bold')
+        plt.axis('off')
+        plt.show()
+
+        BG_COLOR = '#050a1f'; LINE_COLOR = '#00ffff'
+        fig, ax = plt.subplots(figsize=(14, 8))
+        fig.patch.set_facecolor(BG_COLOR); ax.set_facecolor(BG_COLOR)
+
+        draw_full_virtual_court(ax, LINE_COLOR, BG_COLOR)
+
+        ax.plot(*drone_origin, marker='+', color='white', markersize=18, markeredgewidth=2)
+        ax.text(drone_origin[0] + 0.5, drone_origin[1] - 1.0, 'DRONE (0,0)', color='white', fontsize=12, fontweight='bold')
+
+        ax.plot([drone_origin[0], front_target[0]], [drone_origin[1], front_target[1]], color='#00ff00', lw=3, label='Line 1: Drone Heading')
+        ax.plot([drone_origin[0], ball_target[0]], [drone_origin[1], ball_target[1]], color='#ffaa00', lw=3, linestyle='--', label='Line 3: Direction to Ball')
+        ax.plot([drone_origin[0], line2_target[0]], [drone_origin[1], line2_target[1]], color='#ff0000', lw=3, label='Line 2: Remapped Direction')
+
+        ax.set_aspect('equal'); ax.set_xlim(-20, 20); ax.set_ylim(-5, 20)
+        plt.legend(loc='upper right', facecolor='#111111', labelcolor='white')
+        plt.title("OPTICAL AXIS TRACKING // VECTOR DIRECTION ONLY", color='white', fontsize=16, pad=15)
+        plt.grid(True, color='#004466', linestyle=':', alpha=0.5)
+        plt.show()

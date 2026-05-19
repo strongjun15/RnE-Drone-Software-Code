@@ -1,0 +1,263 @@
+from djitellopy import Tello
+from ultralytics import YOLO
+import cv2
+import time
+import numpy as np
+
+BALL_CLASS_ID = 32
+PERSON_CLASS_ID = 0
+
+YOLO_W, YOLO_H = 320, 256
+
+BALL_CONF_TH = 0.5
+HOLDER_TIMEOUT_SEC = 20
+
+CENTER_TOL_RATIO = 0
+Kp = 90
+MAX_YAW = 100
+
+
+def clip_int(v, lo, hi):
+    return int(np.clip(v, lo, hi))
+
+
+def scale_box(box_xyxy, src_w, src_h, dst_w, dst_h):
+    x1, y1, x2, y2 = box_xyxy
+    sx = dst_w / src_w
+    sy = dst_h / src_h
+    return (int(x1 * sx), int(y1 * sy), int(x2 * sx), int(y2 * sy))
+
+
+def box_center(box_xyxy):
+    x1, y1, x2, y2 = box_xyxy
+    return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+
+def get_main_ball_box(result):
+    boxes = result.boxes
+    if boxes is None or len(boxes) == 0:
+        return None, None
+
+    xyxy = boxes.xyxy.cpu().numpy()
+    classes = boxes.cls.cpu().numpy()
+    confs = boxes.conf.cpu().numpy() if boxes.conf is not None else None
+
+    best_box, best_conf, best_area = None, None, 0.0
+
+    for i, (box, cls_id) in enumerate(zip(xyxy, classes)):
+        if int(cls_id) != BALL_CLASS_ID:
+            continue
+        x1, y1, x2, y2 = box
+        area = float(max(0, x2 - x1) * max(0, y2 - y1))
+        if area > best_area:
+            best_area = area
+            best_box = box
+            best_conf = float(confs[i]) if confs is not None else None
+
+    return best_box, best_conf
+
+
+def get_person_tracks(result, conf_th=0.6):
+    out = []
+    boxes = result.boxes
+    if boxes is None or len(boxes) == 0:
+        return out
+
+    xyxy = boxes.xyxy.cpu().numpy()
+    classes = boxes.cls.cpu().numpy()
+    confs = boxes.conf.cpu().numpy() if boxes.conf is not None else None
+
+    tids = None
+    if getattr(boxes, "id", None) is not None:
+        tids = boxes.id.cpu().numpy().astype(int)
+
+    for i, (box, cls_id) in enumerate(zip(xyxy, classes)):
+        if int(cls_id) != PERSON_CLASS_ID:
+            continue
+        c = float(confs[i]) if confs is not None else 0.0
+        if c < conf_th:
+            continue
+        tid = int(tids[i]) if tids is not None else None
+        out.append((box, c, tid))
+
+    return out
+
+
+def find_person_box_by_id(person_tracks, target_id):
+    if target_id is None:
+        return None
+    for (box, conf, tid) in person_tracks:
+        if tid is not None and int(tid) == int(target_id):
+            return box
+    return None
+
+
+def main():
+    model_person = YOLO("yolo11n.pt")
+    model_ball = YOLO("best.pt")
+
+    tello = Tello()
+    tello.connect()
+    print("배터리:", tello.get_battery())
+
+    tello.streamon()
+    frame_read = tello.get_frame_read()
+
+    tello.takeoff()
+    time.sleep(1)
+    tello.move_up(200)
+
+    holder_track_id = None
+    last_holder_box_small = None
+    last_holder_update_t = 0.0
+
+    try:
+        while True:
+            frame = frame_read.frame
+            if frame is None:
+                continue
+
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+            h, w = frame.shape[:2]
+            frame_center_x = w / 2.0
+            annotated = frame.copy()
+
+            small = cv2.resize(frame, (YOLO_W, YOLO_H))
+
+            try:
+                res_p = model_person.track(
+                    source=small,
+                    persist=True,
+                    verbose=False,
+                    conf=0.25,
+                    imgsz=(YOLO_H, YOLO_W),
+                )[0]
+                person_tracks = get_person_tracks(res_p, conf_th=0.6)
+            except Exception as e:
+                print("PERSON track 오류:", e)
+                person_tracks = []
+
+            try:
+                res_b = model_ball(small, verbose=False)[0]
+                ball_box_small, ball_conf = get_main_ball_box(res_b)
+            except Exception as e:
+                print("BALL predict 오류:", e)
+                ball_box_small, ball_conf = None, None
+
+            for (pbox_s, pconf, tid) in person_tracks:
+                pbox_f = scale_box(pbox_s, YOLO_W, YOLO_H, w, h)
+                x1, y1, x2, y2 = pbox_f
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 200, 0), 2)
+                label = f"person id={tid} {pconf:.2f}" if tid is not None else f"person {pconf:.2f}"
+                cv2.putText(annotated, label, (x1, max(0, y1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 0), 2)
+
+            ball_seen_good = False
+            ball_center_ratio = None
+
+            if ball_box_small is not None and ball_conf is not None:
+                bcx_s, bcy_s = box_center(ball_box_small)
+                ball_center_ratio = (bcx_s - YOLO_W / 2.0) / (YOLO_W / 2.0)
+
+                ball_box_full = scale_box(ball_box_small, YOLO_W, YOLO_H, w, h)
+                bx1, by1, bx2, by2 = ball_box_full
+                cv2.rectangle(annotated, (bx1, by1), (bx2, by2), (0, 255, 255), 2)
+                cv2.putText(annotated, f"sports_ball {ball_conf:.2f}", (bx1, max(0, by1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+                if ball_conf >= BALL_CONF_TH:
+                    ball_seen_good = True
+
+                    if len(person_tracks) > 0:
+                        best_d = 1e18
+                        best_holder_tid = None
+                        best_holder_box = None
+
+                        for (pbox_s, pconf, tid) in person_tracks:
+                            pcx, pcy = box_center(pbox_s)
+                            d = (pcx - bcx_s) ** 2 + (pcy - bcy_s) ** 2
+                            if d < best_d:
+                                best_d = d
+                                best_holder_tid = tid
+                                best_holder_box = pbox_s
+
+                        holder_track_id = best_holder_tid
+                        last_holder_box_small = best_holder_box
+                        last_holder_update_t = time.time()
+
+            target_ratio = None
+            mode_text = "NO TARGET"
+            now = time.time()
+
+            holder_valid_time = (last_holder_box_small is not None) and ((now - last_holder_update_t) <= HOLDER_TIMEOUT_SEC)
+
+            if ball_seen_good and (ball_center_ratio is not None):
+                target_ratio = ball_center_ratio
+                mode_text = "TRACK BALL"
+            else:
+                if holder_track_id is not None:
+                    holder_box_now = find_person_box_by_id(person_tracks, holder_track_id)
+                    if holder_box_now is not None:
+                        last_holder_box_small = holder_box_now
+
+                if holder_valid_time and (last_holder_box_small is not None):
+                    hx1, hy1, hx2, hy2 = last_holder_box_small
+                    hcx = (hx1 + hx2) / 2.0
+                    target_ratio = (hcx - YOLO_W / 2.0) / (YOLO_W / 2.0)
+                    mode_text = f"FALLBACK: TRACK HOLDER id={holder_track_id}"
+
+                    holder_full = scale_box(last_holder_box_small, YOLO_W, YOLO_H, w, h)
+                    x1, y1, x2, y2 = holder_full
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                    cv2.putText(annotated, "holder", (x1, max(0, y1 - 10)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+                else:
+                    mode_text = "NO BALL (holder expired)"
+                    holder_track_id = None
+                    last_holder_box_small = None
+
+            yaw_speed = 0
+            cv2.line(annotated, (int(frame_center_x), 0), (int(frame_center_x), h), (0, 255, 0), 1)
+
+            if target_ratio is not None:
+                px = int((target_ratio * (w / 2.0)) + frame_center_x)
+                cv2.circle(annotated, (px, h // 2), 8, (0, 0, 255), -1)
+
+                if abs(target_ratio) > CENTER_TOL_RATIO:
+                    yaw_speed = clip_int(target_ratio * Kp, -MAX_YAW, MAX_YAW)
+                    cv2.putText(annotated, f"{mode_text} yaw={yaw_speed}", (10, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+                else:
+                    cv2.putText(annotated, f"{mode_text} (CENTERED)", (10, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+            else:
+                cv2.putText(annotated, mode_text, (10, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+
+            try:
+                tello.send_rc_control(0, 0, 0, yaw_speed)
+            except Exception as e:
+                print("send_rc_control 오류:", e)
+
+            cv2.imshow("Tello: PERSON track + BALL detect", annotated)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("🧨 q 입력, 정지 및 착륙")
+                tello.send_rc_control(0, 0, 0, 0)
+                tello.land()
+                break
+
+    finally:
+        try:
+            tello.send_rc_control(0, 0, 0, 0)
+        except Exception:
+            pass
+        tello.streamoff()
+        tello.end()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

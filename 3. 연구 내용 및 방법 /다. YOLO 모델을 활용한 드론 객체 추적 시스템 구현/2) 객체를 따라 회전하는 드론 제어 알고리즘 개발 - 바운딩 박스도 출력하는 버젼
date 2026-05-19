@@ -1,0 +1,160 @@
+from djitellopy import Tello
+from ultralytics import YOLO
+import cv2
+import time
+import numpy as np
+
+
+def get_main_person_center_x(result, frame_width):
+    '''
+    YOLO 결과에서 person(class 0)들 중 가장 큰 사람의
+    x 중심 좌표를 (축소된 프레임 기준) 반환.
+    없으면 None으로.
+    '''
+    boxes = result.boxes
+
+    if boxes is None or len(boxes) == 0:
+        return None
+
+    xyxy = boxes.xyxy.cpu().numpy()  # [N, 4] 형태
+    classes = boxes.cls.cpu().numpy()
+
+    main_center_x = None
+    main_area = 0
+
+    for box, cls_id in zip(xyxy, classes):
+        if int(cls_id) != 0:  # 0 = person
+            continue
+
+        x1, y1, x2, y2 = box
+        w = x2 - x1
+        h = y2 - y1
+        area = w * h
+        center_x = (x1 + x2) / 2
+
+        if area > main_area:
+            main_area = area
+            main_center_x = center_x
+
+    return main_center_x
+
+
+def main():
+    # YOLO 디텍션 모델
+    model = YOLO("yolo11n.pt")
+
+    tello = Tello()
+    tello.connect()
+    print("배터리:", tello.get_battery())
+
+    tello.streamon()
+    frame_read = tello.get_frame_read()
+
+    tello.takeoff()
+    time.sleep(2)
+
+    # YOLO 입력 크기 (작게)
+    YOLO_W, YOLO_H = 320, 240
+
+    center_tolerance_ratio = 0.06  # 중앙 ±6% 안이면 회전 안 함
+
+    # yaw 속도 비례 제어 계수
+    Kp = 60
+    MAX_YAW = 80  # Tello rc yaw 속도 최대 절대값
+
+    try:
+        while True:
+            frame = frame_read.frame
+            if frame is None:
+                continue
+
+            h, w = frame.shape[:2]
+            frame_center_x = w / 2
+
+            annotated_frame = frame.copy()
+
+            # 매 프레임마다 YOLO 수행 (3프레임마다 로직 제거)
+            person_center_ratio = None
+
+            # YOLO용으로 축소
+            small = cv2.resize(frame, (YOLO_W, YOLO_H))
+
+            try:
+                results = model(small, verbose=False)
+                result = results[0]
+
+                # 가장 큰 사람의 중심 x (축소된 좌표계 기준)
+                person_center_x_small = get_main_person_center_x(result, YOLO_W)
+
+                if person_center_x_small is not None:
+                    # 축소된 좌표계 → 비율로 변환 (-1 ~ 1)
+                    center_ratio = (person_center_x_small - YOLO_W / 2) / (YOLO_W / 2)
+                    person_center_ratio = center_ratio
+                else:
+                    person_center_ratio = None
+
+                # 디버깅용: 작은 프레임 위에만 박스 그리기
+                annotated_small = result.plot()
+                sh, sw = annotated_small.shape[:2]
+                annotated_frame[0:sh, w - sw:w] = annotated_small
+
+            except Exception as e:
+                print("YOLO 추론 중 오류:", e)
+
+            # 사람 위치에 따라 yaw 속도 결정
+            yaw_speed = 0
+
+            if person_center_ratio is not None:
+                # 화면 중앙 그려주기
+                cv2.line(annotated_frame, (int(frame_center_x), 0),
+                         (int(frame_center_x), h), (0, 255, 0), 1)
+
+                # 사람 x 위치도 표시
+                px = int((person_center_ratio * (w / 2)) + frame_center_x)
+                cv2.circle(annotated_frame, (px, h // 2), 8, (0, 0, 255), -1)
+
+                if abs(person_center_ratio) > center_tolerance_ratio:
+                    yaw_speed = int(person_center_ratio * Kp)
+                    yaw_speed = int(np.clip(yaw_speed, -MAX_YAW, MAX_YAW))
+
+                    cv2.putText(annotated_frame,
+                                f"TRACKING yaw={yaw_speed}",
+                                (10, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                1.0, (0, 255, 255), 2)
+                else:
+                    cv2.putText(annotated_frame, "CENTERED", (10, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                1.0, (0, 255, 0), 2)
+            else:
+                cv2.putText(annotated_frame, "NO PERSON", (10, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            1.0, (0, 0, 255), 2)
+
+            # 블로킹 rotate 대신 연속 RC 제어
+            try:
+                tello.send_rc_control(0, 0, 0, yaw_speed)
+            except Exception as e:
+                print("send_rc_control 오류:", e)
+
+            cv2.imshow("Tello + Fast YOLO Person Tracking", annotated_frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("q 입력, 정지 및 착륙")
+                tello.send_rc_control(0, 0, 0, 0)
+                tello.land()
+                break
+
+    finally:
+        try:
+            tello.send_rc_control(0, 0, 0, 0)
+        except Exception:
+            pass
+        tello.streamoff()
+        tello.end()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

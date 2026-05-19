@@ -1,0 +1,49 @@
+from djitellopy import Tello
+import cv2
+import time
+
+
+def main():
+
+    # 드론 네트워크를 통해 연결하기
+    tello = Tello()
+    tello.connect()
+
+    # 베터리 출력
+    print("배터리:", tello.get_battery(), "%")
+
+    # 비디오 스트림 켜기
+    tello.streamon()
+    frame_read = tello.get_frame_read()
+
+    # 이륙
+    tello.takeoff()
+    time.sleep(2)
+
+    try:
+        while True:
+            frame = frame_read.frame
+            if frame is None:
+                continue
+
+            cv2.imshow("Tello Live", frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("q 입력 -> 착륙 후 종료")
+                break
+
+    finally:
+        # 안전 종료하기
+        try:
+            tello.land()
+        except Exception as e:
+            print("land 오류:", e)
+
+        tello.streamoff()
+        tello.end()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

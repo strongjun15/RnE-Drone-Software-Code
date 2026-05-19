@@ -1,0 +1,88 @@
+# 드라이브 마운팅
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+# yolo 라이브러리 설치
+
+!pip install ultralytics
+
+import ultralytics
+ultralytics.checks()
+
+import yaml
+import os
+from ultralytics import YOLO
+import glob
+from IPython.display import Image, display
+
+# 1. YAML 파일 생성
+data = {
+    'train': '/content/drive/MyDrive/rne_finetuning/keypoint_test4/train/images',
+    'val': '/content/drive/MyDrive/rne_finetuning/keypoint_test4/validation/images',
+    'test': '/content/drive/MyDrive/rne_finetuning/keypoint_test4/test/images',
+
+    'names': {0: 'object'},
+    'kpt_shape': [16, 3] # 16개의 키포인트, (x, y, visible) 3개 값
+}
+
+folder_path = '/content/drive/MyDrive/rne_finetuning/keypoint_test4'
+yaml_path = f'{folder_path}/data.yaml'
+
+os.makedirs(folder_path, exist_ok=True)
+with open(yaml_path, 'w') as f:
+    yaml.dump(data, f, sort_keys=False)
+
+print(f"YAML 파일이 성공적으로 생성되었습니다: {yaml_path}")
+
+# 2. 모델 로드 및 학습
+# 드론 실시간 처리를 위해 가장 가벼운 Nano 모델 유지
+model = YOLO('yolov8n-pose.pt')
+
+# 모델 학습 시작
+results = model.train(
+    data='/content/drive/MyDrive/rne_finetuning/keypoint_test4/data.yaml',
+    epochs=200,
+    imgsz=640,
+    batch=16,
+    patience=50,
+    project='/content/drive/MyDrive/rne_finetuning/keypoint_test4/runs',
+    name='train_result_tuned', # 새로운 세팅의 결과 폴더 이름
+
+    #Loss Weight 정상화 (바운딩 박스를 찾아야 점도 찾습니다)
+    box=7.5,            # 바운딩 박스 가중치 기본값으로 복구 (큰 틀을 정확히 잡도록 유도)
+    pose=15.0,          # 키포인트 가중치 (기본 12.0에서 약간만 상향하여 점에 조금 더 집중)
+
+    # 공간 증강(Spatial Augmentation) 활성화 (위치 암기/과적합 방지)
+    mosaic=1.0,         # 모자이크 켜기 (기본값, YOLO 과적합 방지의 핵심)
+    scale=0.5,          # 크기 확대/축소 켜기 (드론의 고도 변화에 대비)
+    translate=0.1,      # 이동 켜기 (객체가 화면 중심이 아닌 곳에 있어도 찾도록)
+
+    # 제약 조건 유지 (형태 왜곡 방지)
+    degrees=5.0,        # 회전은 아주 살짝만 허용 (-5도 ~ +5도)
+    shear=0.0,          # 찌그러뜨리기 끄기 (객체 형태 유지)
+    fliplr=0.0,         # 좌우반전 끄기 (코트/타겟의 좌우 점 위치가 바뀌지 않도록 유지)
+
+    # 조명/가림 등 픽셀 단위 증강은 기본값 유지 (hsv 변화, erasing 등 작동)
+)
+
+# 3. 최고 성능 모델 로드 및 예측
+# 튜닝된 학습 결과 폴더('train_result_tuned')에서 best.pt 로드
+# 주의: 만약 폴더 이름이 중복되어 train_result_tuned-2 등으로 저장되었다면 경로를 맞춰주세요.
+best_model_path = '/content/drive/MyDrive/rne_finetuning/keypoint_test4/runs/train_result_tuned-2/weights/best.pt'
+best_model = YOLO(best_model_path)
+
+# 테스트 이미지 폴더의 이미지들에 대해 예측 수행
+test_results = best_model.predict(
+    source='/content/drive/MyDrive/rne_finetuning/keypoint_test4/test/images',
+    save=True,
+    project='/content/drive/MyDrive/rne_finetuning/keypoint_test4/runs',
+    name='test_result_tuned'  # 예측 결과도 새로운 폴더에 저장
+)
+
+print("테스트 완료! /runs/test_result_tuned/ 폴더에서 결과 이미지를 확인할 수 있습니다.")
+
+# 결과 이미지 3장 출력
+result_images = glob.glob('/content/drive/MyDrive/rne_finetuning/keypoint_test4/runs/test_result_tuned/*.jpg')[:3]
+for img_path in result_images:
+    display(Image(filename=img_path, width=400))

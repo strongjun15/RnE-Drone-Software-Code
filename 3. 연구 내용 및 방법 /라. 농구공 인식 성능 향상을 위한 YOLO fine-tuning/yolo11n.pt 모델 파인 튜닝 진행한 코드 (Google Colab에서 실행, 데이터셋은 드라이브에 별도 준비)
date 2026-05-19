@@ -1,0 +1,98 @@
+%pip -q install -U ultralytics pyyaml
+
+from google.colab import drive
+drive.mount("/content/drive")
+
+from pathlib import Path
+
+ROOT = Path("/content/drive/MyDrive/RnE")
+DATA_DIR = ROOT / "dataset"
+MODEL_PATH = ROOT / "yolo11n.pt"
+
+assert DATA_DIR.exists(), f"dataset 폴더가 없음: {DATA_DIR}"
+assert MODEL_PATH.exists(), f"yolo 모델 파일이 없음: {MODEL_PATH}"
+
+for split in ["train", "valid", "test"]:
+    assert (DATA_DIR/split/"images").exists(), f"Missing: {DATA_DIR/split/'images'}"
+    assert (DATA_DIR/split/"labels").exists(), f"Missing: {DATA_DIR/split/'labels'}"
+
+print("✅ paths OK")
+print("DATA_DIR:", DATA_DIR)
+print("MODEL_PATH:", MODEL_PATH)
+
+
+
+
+
+import yaml
+from importlib.resources import files
+
+# Ultralytics 패키지 안의 공식 coco.yaml을 읽어서 names를 가져옴
+coco_yaml_path = files("ultralytics").joinpath("cfg/datasets/coco.yaml")
+
+coco_cfg = yaml.safe_load(coco_yaml_path.read_text(encoding="utf-8"))
+names_dict = coco_cfg["names"]            # 보통 {0:'person', 1:'bicycle', ...} 형태
+names = [names_dict[i] for i in range(80)]  # 0~79 순서 리스트로 변환
+
+assert len(names) == 80, f"COCO names 길이가 80이 아님: {len(names)}"
+
+data_yaml = {
+    "path": str(DATA_DIR),
+    "train": "train/images",
+    "val": "valid/images",
+    "test": "test/images",
+    "nc": 80,
+    "names": names,
+}
+
+YAML_PATH = Path("/content/data_coco80.yaml")
+YAML_PATH.write_text(yaml.safe_dump(data_yaml, sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+print("✅ wrote:", YAML_PATH)
+print("first 5:", names[:5])
+print("class 32:", names[32])
+print("last 3:", names[-3:])
+
+
+
+from pathlib import Path
+
+def max_class_id(label_dir: Path):
+    m = -1
+    for p in label_dir.glob("*.txt"):
+        txt = p.read_text(errors="ignore").strip()
+        if not txt:
+            continue
+        for line in txt.splitlines():
+            parts = line.strip().split()
+            if parts:
+                m = max(m, int(parts[0]))
+    return m
+
+max_ids = {}
+for split in ["train", "valid", "test"]:
+    ld = DATA_DIR/split/"labels"
+    max_ids[split] = max_class_id(ld)
+
+print("max class id:", max_ids)
+assert max(max_ids.values()) < 80, f"class id가 79를 넘는 라벨이 있어: {max_ids}"
+print("✅ label ids are within 0~79")
+
+
+
+from ultralytics import YOLO
+
+model = YOLO(str(MODEL_PATH))
+
+results = model.train(
+    data=str(YAML_PATH),
+    epochs=80,
+    imgsz=640,
+    batch=16,
+    workers=2,
+    device=0,          # GPU면 0, CPU면 "cpu"
+    project="/content/runs",
+    name="yolo11n_coco80_align",
+    exist_ok=True,
+)
+print("✅ train done:", results.save_dir)

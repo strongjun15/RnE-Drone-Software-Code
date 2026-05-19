@@ -1,0 +1,381 @@
+from djitellopy import Tello
+from ultralytics import YOLO
+import cv2
+import time
+import numpy as np
+
+TARGET_CLASS_ID = 32  # COCO: sports ball
+
+
+def get_main_ball_box(result):
+    """
+    YOLO 결과에서 sports ball(class 32)들 중 '가장 큰 공' 1개의
+    박스(x1,y1,x2,y2)와 conf를 반환. 없으면 (None, None)
+    """
+    boxes = result.boxes
+    if boxes is None or len(boxes) == 0:
+        return None, None
+
+    xyxy = boxes.xyxy.cpu().numpy()      # [N, 4]
+    classes = boxes.cls.cpu().numpy()
+    confs = boxes.conf.cpu().numpy() if boxes.conf is not None else None
+
+    best_box = None
+    best_conf = None
+    best_area = 0
+
+    for i, (box, cls_id) in enumerate(zip(xyxy, classes)):
+        if int(cls_id) != TARGET_CLASS_ID:
+            continue
+
+        x1, y1, x2, y2 = box
+        area = (x2 - x1) * (y2 - y1)
+        if area > best_area:
+            best_area = area
+            best_box = box
+            best_conf = float(confs[i]) if confs is not None else None
+
+    return best_box, best_conf
+
+
+class Kalman1D_RatioCV:
+    """
+    1D 칼만필터 (Constant Velocity)
+    상태 x = [ratio, ratio_velocity]^T
+    측정 z = ratio
+    """
+
+    def __init__(self, dt, q_ratio=0.02, q_vel=0.10, r_meas=0.08,
+                 p0_ratio=0.30, p0_vel=1.00):
+        self.dt = dt
+
+        # 상태 [ratio, vel]
+        self.x = np.array([[0.0],
+                           [0.0]], dtype=np.float32)
+
+        # 공분산 P
+        self.P = np.array([[p0_ratio, 0.0],
+                           [0.0,      p0_vel]], dtype=np.float32)
+
+        # 상태 전이 F
+        self.F = np.array([[1.0, dt],
+                           [0.0, 1.0]], dtype=np.float32)
+
+        # 관측 행렬 H (ratio만 측정)
+        self.H = np.array([[1.0, 0.0]], dtype=np.float32)
+
+        # 프로세스 노이즈 Q (모델이 얼마나 틀릴 수 있나)
+        self.Q = np.array([[q_ratio, 0.0],
+                           [0.0,     q_vel]], dtype=np.float32)
+
+        # 측정 노이즈 R (YOLO ratio 흔들림)
+        self.R = np.array([[r_meas]], dtype=np.float32)
+
+        self.I = np.eye(2, dtype=np.float32)
+
+        self.initialized = False
+
+    def reset(self, ratio, vel=0.0):
+        self.x[:] = np.array([[float(ratio)],
+                              [float(vel)]], dtype=np.float32)
+        self.initialized = True
+
+    def predict(self):
+        # x = F x
+        self.x = self.F @ self.x
+        # P = F P F^T + Q
+        self.P = self.F @ self.P @ self.F.T + self.Q
+
+        return float(self.x[0, 0])  # predicted ratio
+
+    def update(self, z):
+        z = float(z)
+        Z = np.array([[z]], dtype=np.float32)
+
+        # innovation y = z - Hx
+        y = Z - (self.H @ self.x)
+
+        # S = HPH^T + R
+        S = self.H @ self.P @ self.H.T + self.R
+
+        # K = P H^T S^-1
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+
+        # x = x + K y
+        self.x = self.x + K @ y
+
+        # P = (I - K H) P
+        self.P = (self.I - K @ self.H) @ self.P
+
+        return float(self.x[0, 0])  # updated ratio
+
+    def innovation_abs(self, z):
+        """현재 예측값과 측정값 차이(|z - Hx|)"""
+        return abs(float(z) - float((self.H @ self.x)[0, 0]))
+
+
+def main():
+    YOLO_W, YOLO_H = 320, 240
+
+    # YOLO 필터링(추천)
+    YOLO_CONF_THRES = 0.20       # 낮추면 더 잘 잡지만 오탐↑
+    YOLO_IOU_THRES = 0.45
+
+    # 업데이트할지 게이팅
+    MIN_UPDATE_CONF = 0.25       # 이 conf 아래면 칼만 업데이트 안 함
+    MAX_INNOVATION = 0.55        # 예측 ratio와 관측 ratio 차이가 이보다 크면 이상치로 보고 업데이트 안 함
+
+    # 가려짐 때도 예측으로 yaw를 계속 할자
+    HOLD_FRAMES_WHEN_MISSING = 10  # 탐지 끊겨도 예측으로 버틸 프레임 수
+    YAW_WHEN_MISSING_SCALE = 0.65  # 탐지 없음 구간에서 yaw를 얼마나 약하게 할지 (0~1)
+
+    # 중앙 허용 오차
+    center_tolerance_ratio = 0.06
+
+    # yaw 비례제어
+    Kp = 60
+    MAX_YAW = 80
+
+    # 칼만필터 파라미터(추천 시작점)
+    # - R(측정 노이즈) ↑ : YOLO 덜 믿고 더 부드러움 / 반응 느림
+    # - Q(프로세스 노이즈) ↑ : 급격한 움직임 더 잘 따라감 / 흔들림↑
+    KF_DT = 1.0 / 30.0      # 대충 30fps 가정. 실제 fps에 맞추면 더 좋음.
+    KF_Q_RATIO = 0.02
+    KF_Q_VEL = 0.10
+    KF_R_MEAS = 0.08
+    KF_P0_RATIO = 0.30
+    KF_P0_VEL = 1.00
+
+
+    model = YOLO("best.pt")
+
+    tello = Tello()
+    tello.connect()
+    print("배터리:", tello.get_battery())
+
+    tello.streamon()
+    frame_read = tello.get_frame_read()
+
+    tello.takeoff()
+    time.sleep(1)
+
+    # 칼만필터 생성
+    kf = Kalman1D_RatioCV(
+        dt=KF_DT,
+        q_ratio=KF_Q_RATIO,
+        q_vel=KF_Q_VEL,
+        r_meas=KF_R_MEAS,
+        p0_ratio=KF_P0_RATIO,
+        p0_vel=KF_P0_VEL
+    )
+
+    missing_count = 0  # 탐지 끊긴 프레임 수
+
+    try:
+        while True:
+            frame = frame_read.frame
+            if frame is None:
+                continue
+
+            # Tello frame -> OpenCV BGR
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+            h, w = frame.shape[:2]
+            frame_center_x = w / 2
+            annotated_frame = frame.copy()
+
+            small = cv2.resize(frame, (YOLO_W, YOLO_H))
+
+            # 1) 칼만 예측은 매 프레임 수행
+            pred_ratio = kf.predict() if kf.initialized else None
+
+            ball_box_full = None
+            ball_conf = None
+            meas_ratio = None
+            updated_this_frame = False
+
+            # 2) YOLO 측정(있으면 update)
+            try:
+                results = model.predict(
+                    source=small,
+                    conf=YOLO_CONF_THRES,
+                    iou=YOLO_IOU_THRES,
+                    classes=[TARGET_CLASS_ID],
+                    verbose=False
+                )
+                result = results[0]
+
+                ball_box_small, ball_conf = get_main_ball_box(result)
+
+                if ball_box_small is not None:
+                    x1, y1, x2, y2 = ball_box_small
+
+                    # small -> full 스케일 변환(그리기 용)
+                    sx = w / YOLO_W
+                    sy = h / YOLO_H
+                    fx1, fy1, fx2, fy2 = int(x1 * sx), int(y1 * sy), int(x2 * sx), int(y2 * sy)
+                    ball_box_full = (fx1, fy1, fx2, fy2)
+
+                    # 측정 ratio (-1~1)
+                    ball_center_x_small = (x1 + x2) / 2
+                    meas_ratio = (ball_center_x_small - YOLO_W / 2) / (YOLO_W / 2)
+
+                    # 초기화(첫 탐지)
+                    if not kf.initialized:
+                        kf.reset(meas_ratio, vel=0.0)
+                        pred_ratio = meas_ratio
+
+                    # 게이팅: conf 낮거나, 예측과 너무 다르면 update skip
+                    do_update = True
+                    if ball_conf is not None and ball_conf < MIN_UPDATE_CONF:
+                        do_update = False
+
+                    if kf.initialized and meas_ratio is not None:
+                        if kf.innovation_abs(meas_ratio) > MAX_INNOVATION:
+                            do_update = False
+
+                    if do_update and meas_ratio is not None:
+                        fused_ratio = kf.update(meas_ratio)
+                        pred_ratio = fused_ratio
+                        updated_this_frame = True
+                        missing_count = 0
+                    else:
+                        # 측정은 있지만 update 안 함 -> 예측만 사용
+                        missing_count += 1
+
+                else:
+                    # 탐지 자체가 없음
+                    missing_count += 1
+
+            except Exception as e:
+                print("YOLO 추론 중 오류:", e)
+                missing_count += 1
+
+            # 3) yaw 결정: 칼만 추정(pred_ratio)을 사용
+            yaw_speed = 0
+            use_ratio = None
+
+            if kf.initialized and pred_ratio is not None:
+                if missing_count <= HOLD_FRAMES_WHEN_MISSING:
+                    use_ratio = pred_ratio
+                else:
+                    use_ratio = None  # 너무 오래 못 찾으면 포기(안전)
+
+            if use_ratio is not None:
+                # 화면 중앙선
+                cv2.line(annotated_frame, (int(frame_center_x), 0),
+                         (int(frame_center_x), h), (0, 255, 0), 1)
+
+                # 빨간 점 (예측 공 x 위치)
+                px = int((use_ratio * (w / 2)) + frame_center_x)
+                cv2.circle(annotated_frame, (px, h // 2), 8, (0, 0, 255), -1)
+
+                # 공 박스 (탐지된 프레임일 때만 실제 박스 표시)
+                if ball_box_full is not None:
+                    x1, y1, x2, y2 = ball_box_full
+                    cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                    label = "sports_ball"
+                    if ball_conf is not None:
+                        label += f" {ball_conf:.2f}"
+                    cv2.putText(annotated_frame, label, (x1, max(0, y1 - 8)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+                # yaw 제어
+                if abs(use_ratio) > center_tolerance_ratio:
+                    yaw_speed = int(use_ratio * Kp)
+                    yaw_speed = int(np.clip(yaw_speed, -MAX_YAW, MAX_YAW))
+
+                    # 탐지 없음(예측만) 구간에서는 yaw를 약하게
+                    if not updated_this_frame:
+                        yaw_speed = int(yaw_speed * YAW_WHEN_MISSING_SCALE)
+
+                    cv2.putText(annotated_frame,
+                                f"KF TRACK yaw={yaw_speed} miss={missing_count}",
+                                (10, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+                else:
+                    cv2.putText(annotated_frame, "BALL CENTERED", (10, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+
+                # 디버그: 측정 vs 예측
+                if meas_ratio is not None:
+                    cv2.putText(annotated_frame,
+                                f"meas={meas_ratio:+.2f} pred={pred_ratio:+.2f} conf={ball_conf if ball_conf else 0:.2f}",
+                                (10, 75),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                else:
+                    cv2.putText(annotated_frame,
+                                f"meas=None pred={pred_ratio:+.2f}",
+                                (10, 75),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+            else:
+                cv2.putText(annotated_frame, "NO BALL (KF LOST)", (10, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                yaw_speed = 0
+
+            # 4) RC 제어
+            try:
+                tello.send_rc_control(0, 0, 0, yaw_speed)
+            except Exception as e:
+                print("send_rc_control 오류:", e)
+
+            cv2.imshow("Tello + YOLO Sports Ball Tracking (KF)", annotated_frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("🧨 q 입력, 정지 및 착륙")
+                tello.send_rc_control(0, 0, 0, 0)
+                tello.land()
+                break
+
+    finally:
+        try:
+            tello.send_rc_control(0, 0, 0, 0)
+        except Exception:
+            pass
+        tello.streamoff()
+        tello.end()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
+
+
+'''
+YOLO_CONF_THRES (추천 0.20)
+↓ 더 잘 잡음(가려짐/작은 공) 대신 오탐↑
+↑ 오탐↓ 대신 놓침↑
+
+YOLO_IOU_THRES (추천 0.45)
+보통은 건드릴 일 적음
+
+2) “업데이트(관측 반영) 게이팅”
+
+MIN_UPDATE_CONF (추천 0.25)
+오탐이 칼만을 망치는 걸 막는 1차 방어선
+
+MAX_INNOVATION (추천 0.55)
+갑자기 화면 반대편으로 튀는 측정값(대부분 오탐) 배제
+값 너무 작으면 “진짜 공”도 업데이트 안 될 수 있음
+
+3) 가려짐 버티기(추적 유지)
+
+HOLD_FRAMES_WHEN_MISSING (추천 10)
+탐지 끊겨도 예측으로 yaw를 계속하는 최대 프레임 수
+너무 크면 “엉뚱한 방향”으로 계속 돌 위험
+
+YAW_WHEN_MISSING_SCALE (추천 0.65)
+탐지 없는 구간에서 yaw를 약하게 해서 폭주 방지
+
+4) 칼만필터 느낌을 바꾸는 핵심 2개
+
+KF_R_MEAS (추천 0.08) ← YOLO를 얼마나 믿을지
+↑ 더 부드러움 / 반응 느림
+↓ 더 민감 / 흔들림 증가
+
+KF_Q_VEL (추천 0.10) ← 급변을 얼마나 허용할지
+↑ 급격한 움직임도 따라감
+↓ 더 매끈하지만 가려짐 후 복귀가 느릴 수 있음
+'''
